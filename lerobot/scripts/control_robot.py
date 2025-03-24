@@ -96,6 +96,8 @@ from huggingface_hub import create_branch
 from omegaconf import DictConfig
 from PIL import Image
 from termcolor import colored
+import threading
+import socket
 
 # from safetensors.torch import load_file, save_file
 from lerobot.common.datasets.compute_stats import compute_stats
@@ -212,6 +214,30 @@ def teleoperate(robot: Robot, fps: int | None = None, teleop_time_s: float | Non
         if teleop_time_s is not None and time.perf_counter() - start_time > teleop_time_s:
             break
 
+def two_arms_teleoperate(right_robot: Robot, left_robot: Robot, fps: int | None = None, teleop_time_s: float | None = None):
+    # TODO(rcadene): Add option to record logs
+    if not right_robot.is_connected:
+        right_robot.connect()
+
+    if not left_robot.is_connected:
+        left_robot.connect()
+
+    start_time = time.perf_counter()
+    while True:
+        now = time.perf_counter()
+        right_robot.teleop_step()
+        left_robot.teleop_step()
+
+        if fps is not None:
+            dt_s = time.perf_counter() - now
+            busy_wait(1 / fps - dt_s)
+
+        dt_s = time.perf_counter() - now
+        log_control_info(right_robot, dt_s, fps=fps)
+        log_control_info(left_robot, dt_s, fps=fps)
+
+        if teleop_time_s is not None and time.perf_counter() - start_time > teleop_time_s:
+            break
 
 def record_dataset(
     robot: Robot,
@@ -766,16 +792,41 @@ if __name__ == "__main__":
     del kwargs["mode"]
     del kwargs["robot"]
 
-    robot = make_robot(robot_name)
-    if control_mode == "teleoperate":
-        teleoperate(robot, **kwargs)
-    elif control_mode == "record_dataset":
-        record_dataset(robot, **kwargs)
-    elif control_mode == "replay_episode":
-        replay_episode(robot, **kwargs)
+    if robot_name == "gen72_two_arms_leader" and control_mode == "teleoperate":
+        print("gen72_two_arms_leader")
+        right_robot, left_robot = make_robot(robot_name)
+        # two_arms_teleoperate(right_robot, left_robot, **kwargs)
 
-    elif control_mode == "run_policy":
-        pretrained_policy_path = get_pretrained_policy_path(args.pretrained_policy_name_or_path)
-        hydra_cfg = init_hydra_config(pretrained_policy_path / "config.yaml", args.overrides)
-        policy = make_policy(hydra_cfg=hydra_cfg, pretrained_policy_name_or_path=pretrained_policy_path)
-        run_policy(robot, policy, hydra_cfg)
+        if not right_robot.is_connected:
+            right_robot.connect()
+        if not left_robot.is_connected:
+            left_robot.connect()
+
+        # print(f"right_robot.calibration_path = {right_robot.calibration_path}")
+        # print(f"left_robot.calibration_path = {left_robot.calibration_path}")
+
+        # teleoperate(left_robot, **kwargs)
+        thread1 = threading.Thread(target=teleoperate, args=(right_robot), kwargs=kwargs)
+        thread2 = threading.Thread(target=teleoperate, args=(left_robot), kwargs=kwargs)
+
+        # 启动线程
+        thread1.start()
+        thread2.start()
+
+        # 等待线程结束
+        thread1.join()
+        thread2.join()
+    else:
+        robot = make_robot(robot_name)
+        if control_mode == "teleoperate":
+            teleoperate(robot, **kwargs)
+        elif control_mode == "record_dataset":
+            record_dataset(robot, **kwargs)
+        elif control_mode == "replay_episode":
+            replay_episode(robot, **kwargs)
+
+        elif control_mode == "run_policy":
+            pretrained_policy_path = get_pretrained_policy_path(args.pretrained_policy_name_or_path)
+            hydra_cfg = init_hydra_config(pretrained_policy_path / "config.yaml", args.overrides)
+            policy = make_policy(hydra_cfg=hydra_cfg, pretrained_policy_name_or_path=pretrained_policy_path)
+            run_policy(robot, policy, hydra_cfg)

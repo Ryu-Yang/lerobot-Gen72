@@ -4,6 +4,8 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 import os
 import ctypes
+import platform
+import sys
 
 import numpy as np
 import torch
@@ -18,6 +20,7 @@ from lerobot.common.robot_devices.motors.dynamixel import (
 from lerobot.common.robot_devices.motors.utils import MotorsBus
 from lerobot.common.robot_devices.utils import RobotDeviceAlreadyConnectedError, RobotDeviceNotConnectedError
 from concurrent.futures import ThreadPoolExecutor
+from collections import deque
 
 
 URL_HORIZONTAL_POSITION = {
@@ -39,6 +42,28 @@ TARGET_90_DEGREE_POSITION = np.array([0, 0, 0, 0, 0, 0, 0, 0])
 GRIPPER_OPEN = np.array([-400])
 
 FLAG_FOLLOW=0 #1为高跟随,0为低跟随
+
+WINDOW_SIZE = 5
+
+# 常量预计算
+SCALE_FACTOR = 90 / 1024  # 电机值到关节角度的比例系数
+GRIPPER_SCALE = (90 * 100) / (1024 * 62)  # 夹爪转换比例系数
+GRIPPER_OFFSET = (98 * 100) / 62          # 夹爪转换偏移量
+
+DLL_PATH = os.getenv("DLL_PATH", "/home/ryu-yang/Repos/lerobot-Gen72/lerobot/common/robot_devices/robots/libs")
+
+# End loader
+if platform.machine() == "x86_64":
+    DLL_PATH = os.path.join(DLL_PATH, 'linux_x86', 'libRM_Base.so.1.0.0')
+elif sys.platform == "win32":
+    if sys.maxsize > 2**32:
+        DLL_PATH = os.path.join(DLL_PATH, 'win_64', 'RM_Base.dll')
+    else:
+        DLL_PATH = os.path.join(DLL_PATH, 'win_32', 'RM_Base.dll')
+        print(DLL_PATH)
+else:
+    DLL_PATH = os.path.join(DLL_PATH, 'linux_arm', 'libRM_Base.so.1.0.0')
+
 
 def apply_homing_offset(values: np.array, homing_offset: np.array) -> np.array:
     for i in range(len(values)):
@@ -147,6 +172,7 @@ def reset_arm(arm: MotorsBus):
     # TODO(rcadene): why?
     # Use 'position control current based' for gripper
     arm.write("Operating_Mode", OperatingMode.CURRENT_CONTROLLED_POSITION.value, "gripper")
+    arm.write("Goal_Current", 50, "gripper")
 
     # Make sure the native calibration (homing offset abd drive mode) is disabled, since we use our own calibration layer to be more generic
     arm.write("Homing_Offset", 0)
@@ -203,6 +229,18 @@ def run_arm_calibration(arm: MotorsBus, name: str, arm_type: str):
 ########################################################################
 # Alexander Koch robot arm
 ########################################################################
+
+class MovingAverageFilter:
+    def __init__(self, window_size):
+        self.window_size = window_size
+        self.buffer = deque(maxlen=window_size)
+    
+    def update(self, new_value):
+        self.buffer.append(new_value)
+        return sum(self.buffer) / len(self.buffer)
+    
+    def get_last(self):
+        return self.buffer[0]
 
 @dataclass
 class KochRobotConfig:
@@ -315,8 +353,12 @@ class KochRobot:
 
     def __init__(
         self,
+        ip,
+        calibration_path,
+        start_pose,
+        joint_p_limit,
+        joint_n_limit,
         config: KochRobotConfig | None = None,
-        calibration_path: Path = ".cache/calibration/koch.pkl",
         **kwargs,
     ):
         if config is None:
@@ -328,14 +370,17 @@ class KochRobot:
         self.cameras = self.config.cameras
         self.is_connected = False
         self.logs = {}
+        self.start_pose = start_pose
+        self.joint_p_limit = joint_p_limit
+        self.joint_n_limit = joint_n_limit
         #  gen72机械臂接入，dll文件路径
-        dllPath = '/home/ryu-yang/Repos/lerobot_Gen72/lerobot/common/robot_devices/robots/libRM_Base.so.1.0.0'
+        dllPath = DLL_PATH
         self.pDll = ctypes.cdll.LoadLibrary(dllPath)
         #  连接机械臂
-        self.pDll.RM_API_Init(72,0) 
-        byteIP = bytes("192.168.1.18","gbk")
+        self.pDll.RM_API_Init(72,0)
+        byteIP = bytes(ip,"gbk")
         self.nSocket = self.pDll.Arm_Socket_Start(byteIP, 8080, 200)
-        print (self.nSocket)
+        print(f"self.nSocket = {self.nSocket}")
         #  夹爪标志位
         self.gipflag=1
         self.gipflag_send=1
@@ -353,6 +398,11 @@ class KochRobot:
         self.joint_obs_present=[0.0]*8
         #推理输出部分-接收模型推理的关节角度，写入gen72 API中
         self.joint_send=float_joint()
+
+        self.frame_counter = 0  # 帧计数器
+
+        self.filters = [MovingAverageFilter(WINDOW_SIZE) for _ in range(7)]
+
 
         #gen72API
         self.pDll.Movej_Cmd.argtypes = (ctypes.c_int, ctypes.c_float * 7, ctypes.c_byte, ctypes.c_float, ctypes.c_bool)
@@ -377,11 +427,7 @@ class KochRobot:
         self.pDll.Get_Read_Holding_Registers.restype=ctypes.c_int
         self.pDll.Set_High_Speed_Eth.argtypes = (ctypes.c_int, ctypes.c_byte, ctypes.c_bool)
         self.pDll.Set_High_Speed_Eth.restype = ctypes.c_int
-        #gen72关节初始化，移动到零位
-        float_joint = ctypes.c_float * 7
-        joint_base = float_joint(*[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-        ret=self.pDll.Movej_Cmd(self.nSocket, joint_base, 50, 1, 0)
-        print('机械臂是否回到初始位置',ret)
+
         #打开高速网络配置
         self.pDll.Set_High_Speed_Eth(self.nSocket,1,0)
         #设置末端工具接口电压为24v
@@ -389,7 +435,14 @@ class KochRobot:
         #打开modbus模式
         self.pDll.Set_Modbus_Mode(self.nSocket,1,115200,2,2,1)
         #初始化夹爪为打开状态
-        self.pDll.Write_Single_Register(self.nSocket,1,40000,100,1,1)
+        self.pDll.Write_Single_Register(self.nSocket, 1, 40000, 100, 1, 1)
+
+        print(f"Set_Collision_Stage = {self.pDll.Set_Collision_Stage(self.nSocket, 0, 0)}")
+        # stage = ctypes.c_int_p
+
+        # self.pDllGet_Collision_Stag(self.nSocket, stage)
+
+        # print(f"stage = {stage}")
 
 
     def connect(self):
@@ -413,19 +466,32 @@ class KochRobot:
             # Reset all arms before setting calibration
             # for name in self.follower_arms:
             #     reset_arm(self.follower_arms[name])
+
             for name in self.leader_arms:
                 reset_arm(self.leader_arms[name])
 
             with open(self.calibration_path, "rb") as f:
                 calibration = pickle.load(f)
+
+            #gen72关节初始化，移动到初始操作位置
+            joint_base = (ctypes.c_float * 7)(*self.start_pose)
+            ret=self.pDll.Movej_Cmd(self.nSocket, joint_base, 20, 1, 0)
+            print('机械臂是否回到开始位置',ret)
+
         else:
             # Run calibration process which begins by reseting all arms
+
             #创建初始化的路径
             calibration = self.run_calibration()
 
             self.calibration_path.parent.mkdir(parents=True, exist_ok=True)
             with open(self.calibration_path, "wb") as f:
                 pickle.dump(calibration, f)
+
+            #gen72关节初始化，移动到零位
+            joint_base = (ctypes.c_float * 7)(*[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            ret=self.pDll.Movej_Cmd(self.nSocket, joint_base, 20, 1, 0)
+            print('机械臂是否回到初始位置',ret)
 
         # Set calibration
         # for name in self.follower_arms:
@@ -459,52 +525,54 @@ class KochRobot:
 
 
     def teleop_step(
-        self, record_data=False
+        self, record_data=False, 
     ) -> None | tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+        self.frame_counter += 1
+
         if not self.is_connected:
             raise RobotDeviceNotConnectedError(
                 "KochRobot is not connected. You need to run `robot.connect()`."
             )
-        # Prepare to assign the positions of the leader to the follower
+
         for name in self.leader_arms:
-            now = time.perf_counter()
-            #读取当领导臂电机数据
-            self.leader_pos[name] = self.leader_arms[name].read("Present_Position")
-            #电机数据到关节角度的转换
+            # 读取领导臂电机数据
+            read_start = time.perf_counter()
+            leader_pos = self.leader_arms[name].read("Present_Position")
+            self.leader_pos[name] = leader_pos
+            self.logs[f"read_leader_{name}_pos_dt_s"] = time.perf_counter() - read_start
+
+            # 电机数据到关节角度的转换，关节角度处理（向量化操作）
             for i in range(7):
-                processed_value = round(((self.leader_pos[name][i]) / 1024) * 90, 2)
-                self.joint_teleop_write[i] = processed_value
-            # for i in range(8):
-            #   print(self.leader_pos[name][i])
-            # self.joint_teleop_write[1] = 0-self.joint_teleop_write[1]
-            self.joint_teleop_write[3] = 0-self.joint_teleop_write[3]
-            self.joint_teleop_write[5] = 0-self.joint_teleop_write[5]
-            self.logs[f"read_leader_{name}_pos_dt_s"] = time.perf_counter() - now
-        # for i in range(7):
-        #     print(self.joint_teleop_write[i])
-        
-        for name in self.leader_arms:
-            now = time.perf_counter()
-            #电机角度到夹爪开合度的换算
-            giper_trans = (((self.leader_pos[name][7]) / 1024) * 90 + 98)/ 62 * 100
-            #调用透传API，控制gen72移动到目标位置
+                # 数值转换
+                value = round(leader_pos[i] * SCALE_FACTOR, 2)
 
-            giper_trans=round(giper_trans, 2)
-            for i in range(7):
-                self.joint_teleop_write[i] = ctypes.c_float(round(float(self.joint_teleop_write[i]), 2))
+                # 特定关节取反（3号和5号）
+                if i in {3, 5}:
+                    value = -value
 
+                # 限幅
+                clamped_value = max(self.joint_n_limit[i], min(self.joint_p_limit[i], value))
 
-            self.pDll.Movej_CANFD(self.nSocket,self.joint_teleop_write,FLAG_FOLLOW,0)
-            #夹爪控制
-            #状态为张开，且需要关闭夹爪
-            if (giper_trans < 21) and (self.gipflag == 1):
-                ret_giper = self.pDll.Write_Single_Register(self.nSocket, 1, 40000, 10, 1, 1)
-                self.gipflag=0
-            #状态为闭合，且需要张开夹爪
-            if (giper_trans > 79) and (self.gipflag == 0):
-                ret_giper = self.pDll.Write_Single_Register(self.nSocket, 1, 40000, 100, 1, 1)
-                self.gipflag=1
-            self.logs[f"write_follower_{name}_goal_pos_dt_s"] = time.perf_counter() - now
+                # 移动平均滤波
+                filter_value = self.filters[i].update(clamped_value)
+
+                # if abs(filter_value - self.filters[i].get_last()) / WINDOW_SIZE > 180 ##超180度/s位移限制，暂时不弄
+
+                # 直接使用内存视图操作
+                self.joint_teleop_write[i] = filter_value
+
+            # 电机角度到夹爪开合度的换算
+            giper_value = leader_pos[7] * GRIPPER_SCALE + GRIPPER_OFFSET
+            clamped_giper = max(0, min(100, int(giper_value)))
+
+            # 机械臂执行动作（调用透传API，控制gen72移动到目标位置）
+            write_start = time.perf_counter()
+            self.pDll.Movej_CANFD(self.nSocket, self.joint_teleop_write, FLAG_FOLLOW, 0)
+            if self.frame_counter % 5 == 0:
+                print(f"Write_Single_Register: giper.  clamped_giper = {clamped_giper}")
+                self.pDll.Write_Single_Register(self.nSocket, 1, 40000, clamped_giper, 1, 0)
+            self.logs[f"write_follower_{name}_goal_pos_dt_s"] = time.perf_counter() - write_start
+
 
         if not record_data:
             return

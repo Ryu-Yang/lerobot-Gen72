@@ -21,7 +21,7 @@ from lerobot.common.robot_devices.utils import RobotDeviceAlreadyConnectedError,
 from lerobot.common.utils.utils import capture_timestamp_utc
 
 PROTOCOL_VERSION = 2.0
-BAUD_RATE = 57600
+BAUD_RATE = 2000000
 TIMEOUT_MS = 1000
 
 # https://emanual.robotis.com/docs/en/dxl/x/xl330-m077
